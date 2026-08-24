@@ -1,0 +1,1115 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Coordinate Plot with Column and Rows</title>
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+    <script src="https://sql.js.org/dist/sql-wasm.js"></script>
+    <style>
+        body {
+            font-family: sans-serif;
+        }
+
+        #plot-container {
+            position: relative;
+            width: 100%;
+            height: 800px;
+            /* Increased height */
+        }
+
+        #plot,
+        #roi-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+
+        #roi-canvas {
+            pointer-events: none;
+            /* Let mouse events pass through to Plotly by default */
+        }
+
+        #roi-controls {
+            margin-bottom: 10px;
+        }
+
+        #roi-json {
+            width: 100%;
+            height: 100px;
+        }
+
+        #row-count {
+            width: 60px;
+            margin-left: 10px;
+        }
+
+        #time-range-start,
+        #time-range-end {
+            width: 100%;
+            /* Make sliders wider */
+            margin: 5px 0;
+        }
+
+        #time-range-display {
+            font-size: 1.2em;
+            /* Make text larger */
+            font-weight: bold;
+            vertical-align: middle;
+        }
+
+        #division-controls {
+            margin-left: 20px;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="roi-controls">
+        <input type="file" id="dataFileInput" accept=".json,.db" style="display: none;">
+        <button id="loadDataFileBtn">Load Data File (.json/.db)</button>
+        <button id="loadRoiBtn">Load ROI Data</button>
+        <button id="saveRoiBtn">Save ROI Data</button>
+        <button id="exportRoiDataBtn">Export ROI Data</button>
+        <button id="clearRoiBtn">Clear All ROIs</button>
+        <button id="deleteRoiBtn">Delete Selected ROI</button>
+        <label style="margin-left: 10px;">Rows:</label>
+        <input type="number" id="row-count" min="1" value="2">
+        <button id="applyRowsBtn">Apply Rows</button>
+        <button id="duplicateRoiBtn">Duplicate Selected ROI</button>
+        <button id="addColumnBtn">Add Column</button>
+        <button id="removeColumnBtn">Remove Column</button>
+        <button id="resetColumnsBtn">Reset Columns</button>
+        <span id="division-controls">
+            <label>Division Y:</label>
+            <input type="number" id="divisionYInput" value="540">
+            <button id="applyDivisionBtn">Apply Division</button>
+        </span>
+        <br>
+        <label style="margin-left: 20px;">Min Occurrences:</label>
+        <input type="number" id="minOccurrencesInput" value="1" min="1">
+        <button id="applyThresholdBtn">Apply Threshold</button>
+        <span id="roi-status" style="margin-left: 10px; font-weight: bold;"></span>
+        <br>
+        <div id="time-range-controls" style="margin-top: 10px; display: none;">
+            <label for="time-range-start">Time Range:</label>
+            <input type="range" id="time-range-start" />
+            <br>
+            <input type="range" id="time-range-end" />
+            <span id="time-range-display" style="font-size: 1.5em; font-weight: bold;"></span>
+        </div>
+    </div>
+    <div id="plot-container">
+        <div id="plot"></div>
+        <canvas id="roi-canvas"></canvas>
+    </div>
+    <p>Draw ROI: Hold <b>Shift</b> and drag on the plot.<br>
+        Select ROI: Click on any rectangle to select it (selected ROI is bright cyan, others are orange).<br>
+        Move ROI: Drag inside the selected rectangle.<br>
+        Resize ROI: Drag handles on the edges and corners.<br>
+        Adjust Lines: Drag the internal lines of the selected ROI.<br>
+        Move Division Line: Drag the horizontal division line.
+    </p>
+    <label>ROI Data JSON:</label>
+    <textarea id="roi-json" readonly></textarea>
+
+    <script>
+        // --- Global Variables ---
+        let roiData = { warp_points: [], rois: [], divisions: [] };
+        let currentRoi = null;
+        let updatePending = false;
+        let plotDiv = document.getElementById('plot');
+        let canvas = document.getElementById('roi-canvas');
+        let ctx = canvas.getContext('2d');
+        let loadedPlotData = []; // Initialize loadedPlotData as an empty array
+        let myPlot = null; // Global variable to store the Plotly graph object
+
+        // Time range elements
+        const timeRangeContainer = document.getElementById('time-range-controls');
+        const timeRangeStart = document.getElementById('time-range-start');
+        const timeRangeEnd = document.getElementById('time-range-end');
+        const timeRangeDisplay = document.getElementById('time-range-display');
+        let fullTimeRange = { min: 0, max: 1 };
+
+        // Division line
+        let divisionY = null;
+
+        // Interaction state
+        let state = {
+            drawing: false, moving: false, resizing: false, movingLine: false, movingColumnLine: false, movingDivisionLine: false,
+            startPoint: null, roiMoveStart: null, resizeHandle: null, lineIndex: null, columnLineIndex: null
+        };
+        let isInteracting = false; // Flag for simplified rendering during interactions
+
+        // --- Data Loading and Plotting ---
+        function loadData() {
+            console.log('loadData called.');
+            try {
+                const minOccurrences = parseInt(document.getElementById('minOccurrencesInput').value, 10) || 1;
+                const startTime = parseInt(timeRangeStart.value, 10);
+                const endTime = parseInt(timeRangeEnd.value, 10);
+
+                const filteredData = loadedPlotData.filter(item => {
+                    const timestamp = item[0];
+                    return timestamp >= startTime && timestamp <= endTime;
+                });
+
+                const pointCounts = {};
+                const allCoords = [];
+
+                filteredData.forEach((item) => {
+                    if (!item || !Array.isArray(item) || item.length < 2 || !Array.isArray(item[1])) return;
+                    item[1].forEach(coord => {
+                        if (Array.isArray(coord) && coord.length === 2) {
+                            const coordStr = `${coord[0]},${coord[1]}`;
+                            pointCounts[coordStr] = (pointCounts[coordStr] || 0) + 1;
+                            allCoords.push({ x: coord[0], y: coord[1], str: coordStr });
+                        }
+                    });
+                });
+
+                const x = [], y = [];
+                const plottedCoords = new Set();
+
+                allCoords.forEach(c => {
+                    if (pointCounts[c.str] >= minOccurrences && !plottedCoords.has(c.str)) {
+                        x.push(c.x);
+                        y.push(c.y);
+                        plottedCoords.add(c.str);
+                    }
+                });
+
+                var trace = x.length > 0 ? [{
+                    x: x, y: y, mode: 'markers', type: 'scattergl',
+                    marker: { size: 4, color: 'blue', opacity: 0.7 }
+                }] : [];
+
+                if (myPlot) {
+                    Plotly.react(plotDiv, trace, getLayout(), { responsive: true, scrollZoom: true });
+                } else {
+                    Plotly.newPlot(plotDiv, trace, getLayout(), { responsive: true, scrollZoom: true }).then(gd => {
+                        myPlot = gd;
+                        attachPlotlyHandlers(gd);
+                    });
+                }
+                scheduleUpdate();
+
+            } catch (err) {
+                console.error('Error processing file:', err);
+                alert(`Failed to process plot data: ${err.message}`);
+                Plotly.newPlot(plotDiv, [], getLayout(), { responsive: true, scrollZoom: true }).then(gd => {
+                    myPlot = gd;
+                    attachPlotlyHandlers(gd);
+                });
+                scheduleUpdate();
+            }
+        }
+
+        function getLayout() {
+            return {
+                xaxis: { title: 'X Coordinate', range: [0, 1960] }, // Corrected X-axis range
+                yaxis: { title: 'Y Coordinate', range: [1080, 0] }, // Corrected Y-axis range
+                hovermode: 'closest', uirevision: 'true',
+                dragmode: 'pan',
+                plot_bgcolor: 'white',
+                paper_bgcolor: 'white'
+            };
+        }
+
+        function attachPlotlyHandlers(gd) {
+            const resizeObserver = new ResizeObserver(entries => {
+                const { width, height } = entries[0].contentRect;
+                canvas.width = width;
+                canvas.height = height;
+                scheduleUpdate();
+            });
+            resizeObserver.observe(plotDiv);
+
+            const eventLayer = gd.querySelector('.nsewdrag');
+            eventLayer.addEventListener('mousedown', onMouseDown, { capture: true });
+            window.addEventListener('mousemove', onMouseMove, { capture: true });
+            window.addEventListener('mouseup', onMouseUp, { capture: true });
+
+            gd.on('plotly_relayouting', () => {
+                isInteracting = true;
+                scheduleUpdate();
+            });
+
+            // This handler now constrains the view
+            let relayoutDebounceTimer;
+            gd.on('plotly_relayout', (eventData) => {
+                clearTimeout(relayoutDebounceTimer);
+                relayoutDebounceTimer = setTimeout(() => {
+                    const layout = gd.layout;
+                    const update = {};
+                    let clamped = false;
+
+                    // Constrain X-axis
+                    const xRange = [...layout.xaxis.range];
+                    if (xRange[0] < 0) { xRange[0] = 0; clamped = true; }
+                    if (xRange[1] > 1960) { xRange[1] = 1960; clamped = true; }
+                    if (clamped) update['xaxis.range'] = xRange;
+
+                    // Constrain Y-axis (remember it's inverted)
+                    const yRange = [...layout.yaxis.range];
+                    clamped = false;
+                    if (yRange[1] < 0) { yRange[1] = 0; clamped = true; }
+                    if (yRange[0] > 1080) { yRange[0] = 1080; clamped = true; }
+                    if (clamped) update['yaxis.range'] = yRange;
+
+                    // If any axis was clamped, apply the update
+                    if (Object.keys(update).length > 0) {
+                        Plotly.relayout(gd, update);
+                    }
+
+                    isInteracting = false;
+                    scheduleUpdate(); // Final redraw after interaction
+                }, 50);
+            });
+        }
+
+        // --- Coordinate Conversion ---
+        function dataToPixel(x, y) {
+            const { xaxis, yaxis } = plotDiv._fullLayout;
+            if (!xaxis || !yaxis) return null;
+            return { x: xaxis.l2p(x), y: yaxis.l2p(y) };
+        }
+
+        function pixelToData(xPixel, yPixel) {
+            const { xaxis, yaxis } = plotDiv._fullLayout;
+            if (!xaxis || !yaxis) return null;
+            return { x: xaxis.p2l(xPixel), y: yaxis.p2l(yPixel) };
+        }
+
+        function getPlotCoords(event) {
+            const rect = plotDiv.querySelector('.nsewdrag').getBoundingClientRect();
+            const xPixel = event.clientX - rect.left;
+            const yPixel = event.clientY - rect.top;
+            return pixelToData(xPixel, yPixel);
+        }
+
+        // --- Mouse Event Handlers ---
+        function onMouseDown(event) {
+            const coords = getPlotCoords(event);
+            if (!coords) return;
+
+            if (event.shiftKey) {
+                event.preventDefault(); event.stopPropagation();
+                Plotly.relayout(plotDiv, { dragmode: false });
+                isInteracting = true;
+                state.drawing = true;
+                state.startPoint = coords;
+                currentRoi = createNewRoi(coords.x, coords.y);
+                roiData.rois.push(currentRoi);
+                selectRoi(currentRoi);
+                return;
+            }
+
+            if (isOverDivisionLine(coords.x, coords.y)) {
+                event.preventDefault(); event.stopPropagation();
+                Plotly.relayout(plotDiv, { dragmode: false });
+                isInteracting = true;
+                state.movingDivisionLine = true;
+                return;
+            }
+
+            const handle = getResizeHandle(coords.x, coords.y);
+            if (currentRoi && handle) {
+                event.preventDefault(); event.stopPropagation();
+                Plotly.relayout(plotDiv, { dragmode: false });
+                isInteracting = true;
+                state.resizing = true;
+                state.resizeHandle = handle;
+                return;
+            }
+
+            const lineIndex = getLineResizeHandle(coords.x, coords.y);
+            if (currentRoi && lineIndex !== null) {
+                event.preventDefault(); event.stopPropagation();
+                Plotly.relayout(plotDiv, { dragmode: false });
+                isInteracting = true;
+                state.movingLine = true;
+                state.lineIndex = lineIndex;
+                return;
+            }
+
+            const columnLineIndex = getColumnLineHandle(coords.x, coords.y);
+            if (currentRoi && columnLineIndex !== null) {
+                event.preventDefault(); event.stopPropagation();
+                Plotly.relayout(plotDiv, { dragmode: false });
+                isInteracting = true;
+                state.movingColumnLine = true;
+                state.columnLineIndex = columnLineIndex;
+                return;
+            }
+
+            const clickedRoi = findRoiAtPoint(coords.x, coords.y);
+            selectRoi(clickedRoi);
+            if (clickedRoi) {
+                event.preventDefault(); event.stopPropagation();
+                Plotly.relayout(plotDiv, { dragmode: false });
+                isInteracting = true;
+                state.moving = true;
+                state.roiMoveStart = coords;
+            }
+        }
+
+        let lastMouseMoveTime = 0;
+        const mouseMoveThrottle = 16; // roughly 60fps
+
+        function onMouseMove(event) {
+            if (!Object.values(state).some(v => v === true)) {
+                const coords = getPlotCoords(event);
+                if (coords) updateCursor(coords.x, coords.y);
+                return;
+            }
+            event.preventDefault(); event.stopPropagation();
+
+            const now = Date.now();
+            if (now - lastMouseMoveTime < mouseMoveThrottle) return;
+            lastMouseMoveTime = now;
+
+            const coords = getPlotCoords(event);
+            if (!coords) return;
+
+            if (state.drawing) {
+                currentRoi.right = coords.x;
+                currentRoi.row_boundaries[1] = coords.y;
+            } else if (state.moving && currentRoi) {
+                const dx = coords.x - state.roiMoveStart.x;
+                const dy = coords.y - state.roiMoveStart.y;
+                moveRoi(currentRoi, dx, dy);
+                state.roiMoveStart = coords;
+            } else if (state.resizing && currentRoi) {
+                resizeRoi(currentRoi, state.resizeHandle, coords.x, coords.y);
+            } else if (state.movingLine && currentRoi) {
+                moveLine(currentRoi, state.lineIndex, coords.y);
+            } else if (state.movingColumnLine && currentRoi) {
+                moveColumnLine(currentRoi, state.columnLineIndex, coords.x);
+            } else if (state.movingDivisionLine) {
+                divisionY = coords.y;
+                document.getElementById('divisionYInput').value = Math.round(divisionY);
+            }
+            scheduleUpdate();
+        }
+
+        function onMouseUp(event) {
+            isInteracting = false;
+            if (state.drawing && currentRoi) {
+                normalizeRoi(currentRoi);
+                const centerX = (currentRoi.left + currentRoi.right) / 2;
+                currentRoi.middle_lines = [centerX];
+                updateRowLines(currentRoi);
+            }
+            if (state.movingDivisionLine) {
+                roiData.divisions = [divisionY];
+            }
+            Plotly.relayout(plotDiv, { dragmode: 'pan' });
+            resetState();
+            scheduleUpdate();
+        }
+
+        // --- ROI and Line Manipulation ---
+        function createNewRoi(x, y) {
+            return { left: x, right: x, row_boundaries: [y, y], middle_lines: [], v_gap: 0 };
+        }
+
+        function selectRoi(roi) {
+            currentRoi = roi;
+            if (roi) {
+                const numRows = roi.row_boundaries.length - 1;
+                document.getElementById('row-count').value = numRows > 0 ? numRows : 1;
+            }
+            updateStatus();
+        }
+
+        function findRoiAtPoint(x, y) {
+            for (let i = roiData.rois.length - 1; i >= 0; i--) {
+                const roi = roiData.rois[i];
+                const [top, bottom] = getRoiBounds(roi);
+                if (x >= roi.left && x <= roi.right && y >= top && y <= bottom) return roi;
+            }
+            return null;
+        }
+
+        function getResizeHandle(x, y) {
+            if (!currentRoi) return null;
+            const { left, right } = currentRoi;
+            const [top, bottom] = getRoiBounds(currentRoi);
+            const xThreshold = 10 * Math.abs(plotDiv._fullLayout.xaxis.range[1] - plotDiv._fullLayout.xaxis.range[0]) / plotDiv.clientWidth;
+            const yThreshold = 10 * Math.abs(plotDiv._fullLayout.yaxis.range[1] - plotDiv._fullLayout.yaxis.range[0]) / plotDiv.clientHeight;
+
+            const onLeft = Math.abs(x - left) < xThreshold;
+            const onRight = Math.abs(x - right) < xThreshold;
+            const onTop = Math.abs(y - top) < yThreshold;
+            const onBottom = Math.abs(y - bottom) < yThreshold;
+
+            if (onTop && onLeft) return 'top-left'; if (onTop && onRight) return 'top-right';
+            if (onBottom && onLeft) return 'bottom-left'; if (onBottom && onRight) return 'bottom-right';
+            if (onLeft) return 'left'; if (onRight) return 'right';
+            if (onTop) return 'top'; if (onBottom) return 'bottom';
+            return null;
+        }
+
+        function getLineResizeHandle(x, y) {
+            if (!currentRoi) return null;
+            const { left, right, row_boundaries } = currentRoi;
+            const yThreshold = 10 * Math.abs(plotDiv._fullLayout.yaxis.range[1] - plotDiv._fullLayout.yaxis.range[0]) / plotDiv.clientHeight;
+
+            for (let i = 1; i < row_boundaries.length - 1; i++) {
+                if (Math.abs(y - row_boundaries[i]) < yThreshold && x >= left && x <= right) {
+                    return i;
+                }
+            }
+            return null;
+        }
+
+        function getColumnLineHandle(x, y) {
+            if (!currentRoi) return null;
+            const { middle_lines } = currentRoi;
+            const [top, bottom] = getRoiBounds(currentRoi);
+            const xThreshold = 10 * Math.abs(plotDiv._fullLayout.xaxis.range[1] - plotDiv._fullLayout.xaxis.range[0]) / plotDiv.clientWidth;
+
+            for (let i = 0; i < middle_lines.length; i++) {
+                if (Math.abs(x - middle_lines[i]) < xThreshold && y >= top && y <= bottom) {
+                    return i;
+                }
+            }
+            return null;
+        }
+
+        function isOverDivisionLine(x, y) {
+            if (divisionY === null) return false;
+            const yThreshold = 10 * Math.abs(plotDiv._fullLayout.yaxis.range[1] - plotDiv._fullLayout.yaxis.range[0]) / plotDiv.clientHeight;
+            return Math.abs(y - divisionY) < yThreshold;
+        }
+
+        function updateCursor(x, y) {
+            if (state.drawing || state.moving || state.resizing || state.movingLine || state.movingColumnLine || state.movingDivisionLine) return;
+
+            const handle = getResizeHandle(x, y);
+            const lineIndex = getLineResizeHandle(x, y);
+            const colLineIndex = getColumnLineHandle(x, y);
+
+            if (handle) {
+                if (handle.includes('top-left') || handle.includes('bottom-right')) plotDiv.style.cursor = 'nwse-resize';
+                else if (handle.includes('top-right') || handle.includes('bottom-left')) plotDiv.style.cursor = 'nesw-resize';
+                else if (handle.includes('top') || handle.includes('bottom')) plotDiv.style.cursor = 'ns-resize';
+                else if (handle.includes('left') || handle.includes('right')) plotDiv.style.cursor = 'ew-resize';
+            } else if (lineIndex !== null || isOverDivisionLine(x, y)) {
+                plotDiv.style.cursor = 'ns-resize';
+            } else if (colLineIndex !== null) {
+                plotDiv.style.cursor = 'ew-resize';
+            } else if (findRoiAtPoint(x, y)) {
+                plotDiv.style.cursor = 'move';
+            } else {
+                plotDiv.style.cursor = 'crosshair';
+            }
+        }
+
+        function moveRoi(roi, dx, dy) {
+            roi.left += dx; roi.right += dx;
+            roi.row_boundaries = roi.row_boundaries.map(b => b + dy);
+            roi.middle_lines = roi.middle_lines.map(m => m + dx);
+        }
+
+        function resizeRoi(roi, handle, x, y) {
+            const resizedHorizontally = handle.includes('left') || handle.includes('right');
+
+            if (handle.includes('left')) roi.left = x;
+            if (handle.includes('right')) roi.right = x;
+            if (handle.includes('top')) roi.row_boundaries[0] = y;
+            if (handle.includes('bottom')) roi.row_boundaries[roi.row_boundaries.length - 1] = y;
+
+            updateRowLines(roi);
+
+            if (resizedHorizontally) {
+                const numLines = roi.middle_lines.length;
+                if (numLines > 0) {
+                    const roiWidth = roi.right - roi.left;
+                    const new_middle_lines = [];
+                    for (let i = 1; i <= numLines; i++) {
+                        const lineX = roi.left + (i * roiWidth) / (numLines + 1);
+                        new_middle_lines.push(lineX);
+                    }
+                    roi.middle_lines = new_middle_lines;
+                }
+            }
+        }
+
+        function moveLine(roi, index, y) {
+            const top = roi.row_boundaries[index - 1];
+            const bottom = roi.row_boundaries[index + 1];
+            roi.row_boundaries[index] = Math.max(top, Math.min(bottom, y));
+        }
+
+        function moveColumnLine(roi, index, x) {
+            const left = index === 0 ? roi.left : roi.middle_lines[index - 1];
+            const right = index === roi.middle_lines.length - 1 ? roi.right : roi.middle_lines[index + 1];
+            roi.middle_lines[index] = Math.max(left, Math.min(right, x));
+        }
+
+        function normalizeRoi(roi) {
+            if (roi.left > roi.right) [roi.left, roi.right] = [roi.right, roi.left];
+            const [top, bottom] = getRoiBounds(roi);
+            if (top > bottom) roi.row_boundaries.reverse();
+        }
+
+        function resetState() {
+            state.drawing = state.moving = state.resizing = state.movingLine = state.movingColumnLine = state.movingDivisionLine = false;
+            state.startPoint = state.roiMoveStart = state.resizeHandle = state.lineIndex = state.columnLineIndex = null;
+        }
+
+        function updateRowLines(roi) {
+            if (!roi) return;
+            normalizeRoi(roi);
+            const numRows = parseInt(document.getElementById('row-count').value, 10) || 1;
+            const [top, bottom] = getRoiBounds(roi);
+            const height = bottom - top;
+            roi.row_boundaries = [top];
+            for (let i = 1; i < numRows; i++) {
+                roi.row_boundaries.push(top + (i / numRows) * height);
+            }
+            roi.row_boundaries.push(bottom);
+        }
+
+        function getRoiBounds(roi) {
+            const b = roi.row_boundaries;
+            return [b[0], b[b.length - 1]];
+        }
+
+        // --- Sorting and Numbering ---
+        function getSortedRois(rois) {
+            const roisAbove = [];
+            const roisBelow = [];
+
+            if (divisionY !== null) {
+                rois.forEach(roi => {
+                    const [top, bottom] = getRoiBounds(roi);
+                    if ((top + bottom) / 2 < divisionY) {
+                        roisAbove.push(roi);
+                    } else {
+                        roisBelow.push(roi);
+                    }
+                });
+            } else {
+                rois.forEach(roi => roisAbove.push(roi)); // Treat all as "above" if no line
+            }
+
+            const sortGroup = (group) => {
+                const groupedByCol = [];
+                group.forEach(roi => {
+                    let placed = false;
+                    for (let i = 0; i < groupedByCol.length; i++) {
+                        if (Math.abs(groupedByCol[i][0].left - roi.left) <= 20) {
+                            groupedByCol[i].push(roi);
+                            placed = true;
+                            break;
+                        }
+                    }
+                    if (!placed) {
+                        groupedByCol.push([roi]);
+                    }
+                });
+                groupedByCol.sort((a, b) => a[0].left - b[0].left);
+                const sorted = [];
+                groupedByCol.forEach(colGroup => {
+                    colGroup.sort((a, b) => a.row_boundaries[0] - b.row_boundaries[0]);
+                    sorted.push(...colGroup);
+                });
+                return sorted;
+            }
+
+            const sortedAbove = sortGroup(roisAbove);
+            const sortedBelow = sortGroup(roisBelow);
+
+            return [...sortedAbove, ...sortedBelow];
+        }
+
+        // --- Drawing ---
+        function drawCanvas() {
+            const { _fullLayout } = plotDiv;
+            if (!_fullLayout || !_fullLayout.margin) return;
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.save();
+            ctx.translate(_fullLayout.margin.l, _fullLayout.margin.t);
+
+            drawDivisionLine();
+
+            const roisToDraw = getSortedRois(roiData.rois);
+            let fly_counter = 1;
+
+            roisToDraw.forEach(roi => {
+                const isSelected = (roi === currentRoi);
+                const color = isSelected ? '#00FFFF' : 'orange';
+                const [top, bottom] = getRoiBounds(roi);
+
+                const p1 = dataToPixel(roi.left, top);
+                const p2 = dataToPixel(roi.right, bottom);
+                if (!p1 || !p2) return;
+
+                const x = p1.x, y = p1.y;
+                const width = p2.x - x;
+                const height = p2.y - y;
+
+                ctx.strokeStyle = color;
+                ctx.lineWidth = isSelected ? 3 : 1.5;
+                ctx.fillStyle = `rgba(${isSelected ? '0,255,255' : '255,165,0'}, 0.2)`;
+                ctx.fillRect(x, y, width, height);
+                ctx.strokeRect(x, y, width, height);
+
+                ctx.fillStyle = 'red';
+                ctx.font = '10px Arial';
+                for (let i = 0; i < roi.row_boundaries.length - 1; i++) {
+                    const rowTop = roi.row_boundaries[i];
+                    const rowBottom = roi.row_boundaries[i + 1];
+                    const rowCenterY = (rowTop + rowBottom) / 2;
+                    const p = dataToPixel(roi.left, rowCenterY);
+                    if (p) {
+                        ctx.fillText(fly_counter.toString(), p.x + 3, p.y + 3);
+                        fly_counter++;
+                    }
+                }
+
+                if (isInteracting) return; // Simplified view during interaction
+
+                // Draw internal lines
+                ctx.lineWidth = 1;
+                ctx.setLineDash([5, 5]);
+                for (let i = 1; i < roi.row_boundaries.length - 1; i++) {
+                    const lineP = dataToPixel(roi.left, roi.row_boundaries[i]);
+                    if (!lineP) continue;
+                    ctx.beginPath();
+                    ctx.moveTo(p1.x, lineP.y);
+                    ctx.lineTo(p2.x, lineP.y);
+                    ctx.stroke();
+                }
+
+                ctx.setLineDash([2, 3]);
+                for (let i = 0; i < roi.middle_lines.length; i++) {
+                    const lineP = dataToPixel(roi.middle_lines[i], top);
+                    if (!lineP) continue;
+                    ctx.beginPath();
+                    ctx.moveTo(lineP.x, p1.y);
+                    ctx.lineTo(lineP.x, p2.y);
+                    ctx.stroke();
+                }
+                ctx.setLineDash([]);
+
+                if (isSelected) {
+                    const handles = [
+                        { x: roi.left, y: top }, { x: roi.right, y: top }, { x: roi.left, y: bottom }, { x: roi.right, y: bottom },
+                        { x: (roi.left + roi.right) / 2, y: top }, { x: (roi.left + roi.right) / 2, y: bottom },
+                        { x: roi.left, y: (top + bottom) / 2 }, { x: roi.right, y: (top + bottom) / 2 }
+                    ];
+                    ctx.fillStyle = color;
+                    handles.forEach(h => {
+                        const p = dataToPixel(h.x, h.y);
+                        if (p) ctx.fillRect(p.x - 4, p.y - 4, 8, 8);
+                    });
+                }
+            });
+
+            ctx.restore();
+        }
+
+        function drawDivisionLine() {
+            if (divisionY === null) return;
+            const p = dataToPixel(0, divisionY);
+            if (!p) return;
+
+            ctx.strokeStyle = 'purple';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([10, 5]);
+            ctx.beginPath();
+            ctx.moveTo(0, p.y);
+            ctx.lineTo(canvas.width, p.y);
+            ctx.stroke();
+            ctx.setLineDash([]);
+        }
+
+        function scheduleUpdate() {
+            if (!updatePending) {
+                updatePending = true;
+                requestAnimationFrame(() => {
+                    drawCanvas();
+                    document.getElementById('roi-json').value = JSON.stringify(roiData, null, 2);
+                    updatePending = false;
+                });
+            }
+        }
+
+        function updateStatus() {
+            const statusEl = document.getElementById('roi-status');
+            if (currentRoi) {
+                const index = roiData.rois.indexOf(currentRoi) + 1;
+                statusEl.textContent = `ROI ${index} selected (${roiData.rois.length} total)`;
+            } else {
+                statusEl.textContent = roiData.rois.length > 0 ? `${roiData.rois.length} ROIs` : 'No ROIs created';
+            }
+        }
+
+        // --- Time Range and Export ---
+        function setupTimeRange(data) {
+            if (!data || data.length === 0) {
+                timeRangeContainer.style.display = 'none';
+                return;
+            }
+            fullTimeRange.min = data[0][0];
+            fullTimeRange.max = data[data.length - 1][0];
+            timeRangeStart.min = timeRangeEnd.min = fullTimeRange.min;
+            timeRangeStart.max = timeRangeEnd.max = fullTimeRange.max;
+            timeRangeStart.value = fullTimeRange.min;
+            timeRangeEnd.value = fullTimeRange.max;
+            timeRangeContainer.style.display = 'block';
+            updateTimeRangeDisplay();
+        }
+
+        function updateTimeRangeDisplay() {
+            const startTime = parseInt(timeRangeStart.value, 10);
+            const endTime = parseInt(timeRangeEnd.value, 10);
+            const startDate = new Date(startTime * 1000).toLocaleString();
+            const endDate = new Date(endTime * 1000).toLocaleString();
+            timeRangeDisplay.textContent = `From: ${startDate} To: ${endDate}`;
+        }
+
+        timeRangeStart.addEventListener('input', () => {
+            if (parseInt(timeRangeStart.value) > parseInt(timeRangeEnd.value)) {
+                timeRangeEnd.value = timeRangeStart.value;
+            }
+            updateTimeRangeDisplay();
+            loadData();
+        });
+
+        timeRangeEnd.addEventListener('input', () => {
+            if (parseInt(timeRangeEnd.value) < parseInt(timeRangeStart.value)) {
+                timeRangeStart.value = timeRangeEnd.value;
+            }
+            updateTimeRangeDisplay();
+            loadData();
+        });
+
+        function formatTimestamp(unixTimestamp) {
+            const date = new Date(unixTimestamp * 1000);
+            return date.toISOString();
+        }
+
+        function exportRoiData() {
+            if (!currentRoi) {
+                alert("Please select an ROI to export data.");
+                return;
+            }
+            if (!loadedPlotData || loadedPlotData.length === 0) {
+                alert("No plot data loaded.");
+                return;
+            }
+
+            // --- Logic to construct the dynamic filename ---
+
+            // Sort ROIs to get the correct number for the selected one
+            const sortedRois = getSortedRois(roiData.rois);
+            const roiIndex = sortedRois.indexOf(currentRoi);
+            if (roiIndex === -1) {
+                alert("Could not determine the number for the selected ROI.");
+                return;
+            }
+
+            // Calculate the starting fly number (identifier) for the selected ROI
+            let roiIdentifier = 1;
+            for (let i = 0; i < roiIndex; i++) {
+                const numRows = sortedRois[i].row_boundaries.length - 1;
+                roiIdentifier += numRows > 0 ? numRows : 1;
+            }
+
+            // Get start and end times from the sliders
+            const startTime = parseInt(timeRangeStart.value, 10);
+            const endTime = parseInt(timeRangeEnd.value, 10);
+
+            // Helper function to format timestamps for the filename (e.g., YYYYMMDD_HHMMSS)
+            const formatTimestampForFilename = (unixTimestamp) => {
+                const date = new Date(unixTimestamp * 1000);
+                const year = date.getFullYear();
+                const month = (date.getMonth() + 1).toString().padStart(2, '0');
+                const day = date.getDate().toString().padStart(2, '0');
+                const hours = date.getHours().toString().padStart(2, '0');
+                const minutes = date.getMinutes().toString().padStart(2, '0');
+                const seconds = date.getSeconds().toString().padStart(2, '0');
+                return `${year}${month}${day}_${hours}${minutes}${seconds}`;
+            };
+
+            const startTimeString = formatTimestampForFilename(startTime);
+            const endTimeString = formatTimestampForFilename(endTime);
+
+            // Construct the final filename
+            const filename = `roi_${roiIdentifier}_from_${startTimeString}_to_${endTimeString}.txt`;
+
+            // --- End of filename logic ---
+
+
+            const { left, right } = currentRoi;
+            const [top, bottom] = getRoiBounds(currentRoi);
+            const textLines = [];
+
+            const filteredPlotData = loadedPlotData.filter(item => {
+                const timestamp = item[0];
+                return timestamp >= startTime && timestamp <= endTime;
+            });
+
+            // Helper function to format the timestamp as YYYY-MM-DD HH:MM:SS for the content
+            const formatTimestampForTxt = (unixTimestamp) => {
+                const date = new Date(unixTimestamp * 1000);
+                const year = date.getFullYear();
+                const month = (date.getMonth() + 1).toString().padStart(2, '0');
+                const day = date.getDate().toString().padStart(2, '0');
+                const hours = date.getHours().toString().padStart(2, '0');
+                const minutes = date.getMinutes().toString().padStart(2, '0');
+                const seconds = date.getSeconds().toString().padStart(2, '0');
+                return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+            };
+
+            filteredPlotData.forEach(item => {
+                const timestamp = item[0];
+                const coordinates = item[1];
+                if (!Array.isArray(coordinates)) return;
+
+                const formattedTime = formatTimestampForTxt(timestamp);
+
+                coordinates.forEach(coord => {
+                    const [x, y] = coord;
+                    if (x >= left && x <= right && y >= top && y <= bottom) {
+                        textLines.push(`${formattedTime}: [[${x},${y}]]`);
+                    }
+                });
+            });
+
+            if (textLines.length === 0) {
+                alert("No data points found within the selected ROI for the specified time range.");
+                return;
+            }
+
+            // Create and download the TXT file
+            const textContent = textLines.join("\n");
+            const blob = new Blob([textContent], { type: 'text/plain;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+
+            const link = document.createElement("a");
+            link.setAttribute("href", url);
+            // Use the newly constructed filename
+            link.setAttribute("download", filename);
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+        }
+
+
+
+        // --- Button Handlers ---
+        document.getElementById('exportRoiDataBtn').onclick = exportRoiData;
+
+        document.getElementById('loadDataFileBtn').onclick = () => {
+            document.getElementById('dataFileInput').click();
+        };
+
+        document.getElementById('dataFileInput').onchange = async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            if (file.name.endsWith('.db')) {
+                try {
+                    const arrayBuffer = await file.arrayBuffer();
+                    const SQL = await window.initSqlJs({ locateFile: file => `https://sql.js.org/dist/${file}` });
+                    const db = new SQL.Database(new Uint8Array(arrayBuffer));
+                    const stmt = db.prepare("SELECT timestamp, coordinates FROM coordinates ORDER BY timestamp");
+                    const rows = [];
+                    while (stmt.step()) {
+                        const row = stmt.getAsObject();
+                        rows.push([row.timestamp, JSON.parse(row.coordinates)]);
+                    }
+                    stmt.free();
+                    db.close();
+                    loadedPlotData = rows;
+                    setupTimeRange(loadedPlotData);
+                    loadData();
+                } catch (err) {
+                    alert(`Error reading database file: ${err.message}`);
+                }
+            } else {
+                const reader = new FileReader();
+                reader.onload = (evt) => {
+                    try {
+                        loadedPlotData = JSON.parse(evt.target.result);
+                        setupTimeRange(loadedPlotData);
+                        loadData();
+                    } catch (err) {
+                        alert(`Error reading JSON file: ${err.message}`);
+                    }
+                };
+                reader.readAsText(file);
+            }
+        };
+
+        document.getElementById('loadRoiBtn').onclick = () => {
+            const input = document.createElement('input');
+            input.type = 'file'; input.accept = '.json';
+            input.onchange = e => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = (evt) => {
+                    try {
+                        const loadedData = JSON.parse(evt.target.result);
+                        if (!loadedData || !Array.isArray(loadedData.rois)) throw new Error('Invalid format.');
+
+                        // Backward compatibility
+                        roiData = {
+                            warp_points: loadedData.warp_points || [],
+                            rois: loadedData.rois,
+                            divisions: loadedData.divisions || []
+                        };
+
+                        if (roiData.divisions.length > 0) {
+                            divisionY = roiData.divisions[0];
+                            document.getElementById('divisionYInput').value = Math.round(divisionY);
+                        } else {
+                            divisionY = null;
+                        }
+
+                        selectRoi(roiData.rois.length > 0 ? roiData.rois[0] : null);
+                        scheduleUpdate();
+                    } catch (err) { alert(`Invalid JSON: ${err.message}`); }
+                };
+                reader.readAsText(file);
+            };
+            input.click();
+        };
+
+        document.getElementById('saveRoiBtn').onclick = () => {
+            roiData.divisions = divisionY !== null ? [divisionY] : [];
+            const blob = new Blob([JSON.stringify(roiData, null, 2)], { type: 'application/json' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'roi_data.json';
+            a.click();
+            URL.revokeObjectURL(a.href);
+        };
+
+        document.getElementById('clearRoiBtn').onclick = () => {
+            roiData = { warp_points: [], rois: [], divisions: [] };
+            divisionY = null;
+            selectRoi(null);
+            scheduleUpdate();
+        };
+
+        document.getElementById('deleteRoiBtn').onclick = () => {
+            if (!currentRoi) return;
+            const index = roiData.rois.indexOf(currentRoi);
+            if (index > -1) {
+                roiData.rois.splice(index, 1);
+                selectRoi(roiData.rois.length > 0 ? roiData.rois[Math.max(0, index - 1)] : null);
+                scheduleUpdate();
+            }
+        };
+
+        document.getElementById('applyRowsBtn').onclick = () => {
+            if (currentRoi) {
+                updateRowLines(currentRoi);
+                scheduleUpdate();
+            }
+        };
+
+        document.getElementById('applyDivisionBtn').onclick = () => {
+            const yVal = parseFloat(document.getElementById('divisionYInput').value);
+            if (!isNaN(yVal)) {
+                divisionY = yVal;
+                roiData.divisions = [divisionY];
+                scheduleUpdate();
+            }
+        };
+
+        document.getElementById('duplicateRoiBtn').onclick = () => {
+            if (currentRoi) {
+                const newRoi = JSON.parse(JSON.stringify(currentRoi));
+                const [currentTop, currentBottom] = getRoiBounds(currentRoi);
+                const verticalShift = (currentBottom - currentTop) + 8; // 8px gap
+                newRoi.row_boundaries = newRoi.row_boundaries.map(b => b + verticalShift);
+                roiData.rois.push(newRoi);
+                selectRoi(newRoi);
+                scheduleUpdate();
+            }
+        };
+
+        document.getElementById('addColumnBtn').onclick = () => {
+            if (currentRoi) {
+                const numLines = currentRoi.middle_lines.length;
+                const newTotalLines = numLines + 1;
+                const roiWidth = currentRoi.right - currentRoi.left;
+                currentRoi.middle_lines = [];
+                for (let i = 1; i <= newTotalLines; i++) {
+                    const lineX = currentRoi.left + (i * roiWidth) / (newTotalLines + 1);
+                    currentRoi.middle_lines.push(lineX);
+                }
+                scheduleUpdate();
+            }
+        };
+
+        document.getElementById('removeColumnBtn').onclick = () => {
+            if (currentRoi && currentRoi.middle_lines.length > 0) {
+                currentRoi.middle_lines.pop();
+                const numLines = currentRoi.middle_lines.length;
+                if (numLines > 0) {
+                    const roiWidth = currentRoi.right - currentRoi.left;
+                    const new_middle_lines = [];
+                    for (let i = 1; i <= numLines; i++) {
+                        const lineX = currentRoi.left + (i * roiWidth) / (numLines + 1);
+                        new_middle_lines.push(lineX);
+                    }
+                    currentRoi.middle_lines = new_middle_lines;
+                }
+                scheduleUpdate();
+            }
+        };
+
+        document.getElementById('resetColumnsBtn').onclick = () => {
+            if (currentRoi) {
+                currentRoi.middle_lines = [(currentRoi.left + currentRoi.right) / 2];
+                scheduleUpdate();
+            }
+        };
+
+        document.getElementById('applyThresholdBtn').onclick = () => {
+            loadData();
+        };
+
+        // --- Keyboard and Initial Setup ---
+        window.addEventListener('keydown', (event) => {
+            if (!currentRoi) return;
+            const step = 1;
+            let dx = 0, dy = 0;
+            switch (event.key) {
+                case 'ArrowLeft': dx = -step; break;
+                case 'ArrowRight': dx = step; break;
+                case 'ArrowUp': dy = -step; break;
+                case 'ArrowDown': dy = step; break;
+                default: return;
+            }
+            event.preventDefault();
+            moveRoi(currentRoi, dx, dy);
+            scheduleUpdate();
+        });
+
+        // Initial plot setup
+        Plotly.newPlot(plotDiv, [], getLayout(), { responsive: true, scrollZoom: true }).then(gd => {
+            myPlot = gd;
+            attachPlotlyHandlers(gd);
+        });
+        updateStatus();
+
+    </script>
+</body>
+
+</html>
