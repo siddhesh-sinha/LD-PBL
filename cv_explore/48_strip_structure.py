@@ -97,30 +97,33 @@ for m in strip_model:
 from scipy.signal import find_peaks as _fp
 
 
-def edge_scan(x_lo, x_hi, y_top, y_bot):
-    """Find the two bevel lines from the mid-band column profile,
-    then trace each per-row (nearest mid pixel within ±6px) →
-    jagged left/right polylines, median-filtered."""
-    prof = mid[y_top:y_bot, x_lo:x_hi].sum(axis=0).astype(float)
+def trace_line(line_x, y_top, y_bot):
+    """Per-row jagged trace of a vertical mid-band line."""
+    ys = []
+    for y in range(y_top, y_bot):
+        seg = mid[y, max(0, line_x - 6):line_x + 7]
+        on = np.where(seg > 0)[0]
+        ys.append(max(0, line_x - 6) + int(on[len(on) // 2])
+                  if len(on) else line_x)
+    k = 9
+    return np.array([np.median(ys[max(0, i - k):i + k + 1])
+                     for i in range(len(ys))], dtype=int)
+
+
+def edge_scan(x_lo, x_hi, y_top, y_bot, plug_xs, r_plug):
+    """PHYSICAL PRIOR: the strip body extends LEFT from the plug
+    column (cut edge -> tubes -> plugs at the right end). Right
+    boundary = plug column + plug radius. Left boundary = the
+    strongest bevel line searched ONLY left of the plugs."""
+    right_x = int(np.percentile(plug_xs, 90)) + r_plug + 3
+    search_hi = max(x_lo + 6,
+                    int(np.percentile(plug_xs, 10)) - r_plug - 2)
+    prof = mid[y_top:y_bot, x_lo:search_hi].sum(axis=0).astype(float)
     prof = np.convolve(prof, np.ones(5) / 5, mode="same")
-    pk, _ = _fp(prof, height=prof.max() * 0.25, distance=8)
-    if len(pk) >= 2:
-        lx, rx = x_lo + int(pk[0]), x_lo + int(pk[-1])
-    else:
-        lx, rx = x_lo + 3, x_hi - 3
-
-    def trace(line_x):
-        ys = []
-        for y in range(y_top, y_bot):
-            seg = mid[y, max(0, line_x - 6):line_x + 7]
-            on = np.where(seg > 0)[0]
-            ys.append(max(0, line_x - 6) + int(on[len(on) // 2])
-                      if len(on) else line_x)
-        k = 9
-        return np.array([np.median(ys[max(0, i - k):i + k + 1])
-                         for i in range(len(ys))], dtype=int)
-
-    return trace(lx), trace(rx)
+    pk, _ = _fp(prof, height=max(prof.max() * 0.3, 1), distance=6)
+    left_x = x_lo + int(pk[0]) if len(pk) else x_lo + 3
+    return (trace_line(left_x, y_top, y_bot),
+            trace_line(right_x, y_top, y_bot))
 
 
 structure = []
@@ -128,7 +131,9 @@ for m in strip_model:
     si = m["strip"]
     st = lat["strips"][si]
     yt, yb = st["y_top"], st["y_bot"]
-    Lf, Rf = edge_scan(st["x0"], st["x1"], yt, yb)
+    plug_xs = [p["cx"] for p in m["plugs"]]
+    r_plug = int(np.median([p["circ"][2] for p in m["plugs"]]))
+    Lf, Rf = edge_scan(st["x0"], st["x1"], yt, yb, plug_xs, r_plug)
 
     # Robust inscribed rectangle: inside the jagged edges for 90%
     # of rows (strict max/min collapses on a single outlier row)
