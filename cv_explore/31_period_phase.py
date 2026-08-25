@@ -70,23 +70,30 @@ ac_x = np.correlate(cp, cp, mode="full")[len(cp) - 1:]
 lo, hi = int(bw / 9 * 0.75), int(bw / 9 * 1.25)
 lag = lo + int(np.argmax(ac_x[lo:hi]))
 period = parabolic(ac_x, lag)
-ambiguous = ac_x[lag] < 0.15 * ac_x[0]
-if ambiguous:  # fall back: direct peak picking
-    sm = np.convolve(col_proj, np.ones(9) / 9, mode="same")
-    pks, _ = find_peaks(sm, distance=int(bw / 12))
-    pks = np.sort(pks[np.argsort(sm[pks])[-9:]])
-    period = float(np.median(np.diff(pks)))
-    print("  WARNING: x-autocorr ambiguous -> find_peaks fallback")
-phi_x, _ = comb_phase(col_proj, period, 9)
+phi_x, comb_score = comb_phase(col_proj, period, 9)
 x_centers = phi_x + np.arange(9) * period
+# Validity check: rigid comb vs direct peak picking. If the comb catches
+# much less dark mass than the actual peaks, the strips are not on a
+# rigid lattice -> fall back to find_peaks (note it).
+sm = np.convolve(col_proj, np.ones(7) / 7, mode="same")
+pks, _ = find_peaks(sm, distance=int(bw / 14), height=sm.max() * 0.1)
+pks = np.sort(pks[np.argsort(sm[pks])[-9:]])
+peak_score = float(col_proj[pks].sum())
+fallback = (ac_x[lag] < 0.15 * ac_x[0]) or (comb_score < 0.92 * peak_score)
+if fallback and len(pks) == 9:
+    x_centers = pks.astype(float)
+    period = float(np.median(np.diff(pks)))
+    print(f"  WARNING: rigid x-comb misfit (comb score {comb_score:.0f} vs"
+          f" peaks {peak_score:.0f}) -> find_peaks fallback for x-centers")
 print(f"  Strip period: {period:.2f} px  phase: {phi_x:.2f}"
       f"  (autocorr peak ratio {ac_x[lag]/ac_x[0]:.2f})")
 
 strips = []
 for s, xc in enumerate(x_centers):
-    xl = max(0.0, xc - period / 2)
-    xr = min(float(bw), xc + period / 2)
-    strips.append({"idx": s, "x_left": xl, "x_right": xr, "x_center": float(xc)})
+    xl = (x_centers[s - 1] + xc) / 2 if s > 0 else max(0.0, xc - period / 2)
+    xr = (xc + x_centers[s + 1]) / 2 if s < 8 else min(float(bw), xc + period / 2)
+    strips.append({"idx": s, "x_left": float(xl), "x_right": float(xr),
+                   "x_center": float(xc)})
 
 # ── STEP 2: row period dy from summed row projections ───
 row_proj = dark.sum(axis=1).astype(float)
@@ -107,10 +114,10 @@ for st in strips:
     sup = np.where(p_s > 3)[0]
     y0, y1 = (sup[0], sup[-1]) if len(sup) else (0, bh - 1)
     st["phase"], st["gen"], st["keep"] = phi_s, 0, 0
-    for k in range(int(bh / dy) + 1):
+    k_in = [k for k in range(int(bh / dy) + 1)
+            if y0 - 3 <= phi_s + k * dy <= y1 + 3]
+    for k in k_in:
         y = phi_s + k * dy
-        if y < y0 - 3 or y > y1 + 3:
-            continue
         st["gen"] += 1
         n_gen += 1
         xi, yi = int(round(st["x_center"])), int(round(y))
@@ -128,7 +135,7 @@ for st in strips:
             cx, cy = (w8 * xs).sum() / w8.sum(), (w8 * ys).sum() / w8.sum()
         else:
             cx, cy = float(xi), float(y)
-        plugs.append({"strip": st["idx"], "row": st["keep"],
+        plugs.append({"strip": st["idx"], "row": k - k_in[0],
                       "cx": float(cx), "cy": float(cy), "conf": conf})
         st["keep"] += 1
         n_keep += 1
