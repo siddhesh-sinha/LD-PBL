@@ -90,15 +90,41 @@ def lock_lattice(gray, expected_strips=9):
         x0 = 0 if i == 0 else (peaks[i - 1] + pk) // 2
         x1 = w if i == len(peaks) - 1 else (pk + peaks[i + 1]) // 2
         sp = _smooth(d[:, x0:x1].sum(axis=1), 5)
-        rows, _ = find_peaks(sp, distance=int(dy * 0.6),
+        # min distance 0.45*dy: tube racking is irregular and
+        # neighboring plugs can sit closer than the median pitch
+        rows, _ = find_peaks(sp, distance=max(10, int(dy * 0.45)),
                              height=sp.max() * 0.08)
         rows = [int(r) for r in rows]
         if len(rows) >= 3:
             rows = _comb_fill(rows, dy)
         ep = mid[:, x0:x1].sum(axis=0)
         edge_x = int(x0 + np.argmax(ep))
+
+        # Per-plug x: each plug sits at its own depth inside its
+        # tube (insertion varies ±40px), so search each row band
+        # for the densest dark window instead of assuming the
+        # strip center. x - edge_x = plug insertion depth.
+        k = max(int(dy * 0.6) | 1, 7)
+        hk = k // 2
+        xs = []
+        for ry in rows:
+            band = d[max(0, ry - hk):min(h, ry + hk + 1),
+                     x0:x1].sum(axis=0)
+            prof = np.convolve(band, np.ones(k), mode="same")
+            bx = int(np.argmax(prof))
+            xs.append(int(x0 + bx) if prof[bx] >= 0.12 * k * k
+                      else int(pk))
+
+        # Vertical extent of the plastic strip (= the tube rack):
+        # rows outside it (pin rail, bezel) are not plug cells
+        mrow = mid[:, x0:x1].sum(axis=1)
+        ys_on = np.where(mrow > mrow.max() * 0.15)[0]
+        y_top = int(ys_on[0]) if len(ys_on) else 0
+        y_bot = int(ys_on[-1]) if len(ys_on) else h
+
         strips.append({"x": int(pk), "x0": int(x0), "x1": int(x1),
-                       "edge_x": edge_x, "rows": rows})
+                       "edge_x": edge_x, "rows": rows, "xs": xs,
+                       "y_top": y_top, "y_bot": y_bot})
 
     return {"T": T, "dy": dy, "w": w, "h": h, "strips": strips,
             "ref_colproj": d.sum(axis=0).astype(np.int32),
@@ -106,19 +132,21 @@ def lock_lattice(gray, expected_strips=9):
 
 
 def _comb_fill(rows, dy):
-    """Fill missing lattice rows: snap found rows to the comb
-    phase + k*dy, insert teeth the peak finder missed."""
-    phase = int(np.median(np.mod(rows, dy)))
-    lo, hi = min(rows) - dy // 3, max(rows) + dy // 3
-    out = []
-    y = phase
-    while y < lo:
-        y += dy
-    while y <= hi:
-        near = [r for r in rows if abs(r - y) <= 0.35 * dy]
-        out.append(near[0] if near else int(y))
-        y += dy
-    return out
+    """Real peaks stay at their true y (tube spacing is NOT
+    perfectly regular — gaps of 0.9-1.5x dy occur); only fill
+    genuinely large gaps with evenly spaced phantom teeth."""
+    rows = sorted(rows)
+    out = [rows[0]]
+    for r in rows[1:]:
+        gap = r - out[-1]
+        n = int(round(gap / dy))
+        if n >= 2:
+            a = out[-1]
+            step = gap / n
+            for j in range(1, n):
+                out.append(int(round(a + step * j)))
+        out.append(r)
+    return sorted(out)
 
 
 def _corr_shift(ref, cur, search):
@@ -163,8 +191,9 @@ def read_cells(gray, lat, dx=0, dy=0, T=None):
     h, w = gray.shape[:2]
     out = []
     for si, s in enumerate(lat["strips"]):
-        x = s["x"] + dx
+        xs = s.get("xs")
         for ri, y0 in enumerate(s["rows"]):
+            x = (xs[ri] if xs and ri < len(xs) else s["x"]) + dx
             y = y0 + dy
             if not (hk <= x < w - hk and hk <= y < h - hk):
                 out.append((si, ri, x, y, -1.0))
